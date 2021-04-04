@@ -1,146 +1,227 @@
 #!/usr/bin/env bash
 # Pi-hole: A black hole for Internet advertisements
-# (c) 2015, 2016 by Jacob Salmela
-# Network-wide ad blocking via your Raspberry Pi
-# http://pi-hole.net
+# (c) 2017 Pi-hole, LLC (https://pi-hole.net)
+# Network-wide ad blocking via your own hardware.
+#
 # Completely uninstalls Pi-hole
 #
-# Pi-hole is free software: you can redistribute it and/or modify
-# it under the terms of the GNU General Public License as published by
-# the Free Software Foundation, either version 2 of the License, or
-# (at your option) any later version.
+# This file is copyright under the latest version of the EUPL.
+# Please see LICENSE file for your rights under this license.
+
+source "/opt/pihole/COL_TABLE"
+
+while true; do
+    read -rp "  ${QST} Are you sure you would like to remove ${COL_WHITE}Pi-hole${COL_NC}? [y/N] " yn
+    case ${yn} in
+        [Yy]* ) break;;
+        [Nn]* ) echo -e "${OVER}  ${COL_LIGHT_GREEN}Uninstall has been canceled${COL_NC}"; exit 0;;
+        * ) echo -e "${OVER}  ${COL_LIGHT_GREEN}Uninstall has been canceled${COL_NC}"; exit 0;;
+    esac
+done
 
 # Must be root to uninstall
-if [[ $EUID -eq 0 ]];then
-	echo "::: You are root."
+str="Root user check"
+if [[ ${EUID} -eq 0 ]]; then
+    echo -e "  ${TICK} ${str}"
 else
-	echo "::: Sudo will be used for the uninstall."
-  # Check if it is actually installed
-  # If it isn't, exit because the unnstall cannot complete
-  if [[ $(dpkg-query -s sudo) ]];then
-		export SUDO="sudo"
-  else
-    echo "::: Please install sudo or run this as root."
-    exit 1
-  fi
+    # Check if sudo is actually installed
+    # If it isn't, exit because the uninstall can not complete
+    if [ -x "$(command -v sudo)" ]; then
+        export SUDO="sudo"
+    else
+        echo -e "  ${CROSS} ${str}
+            Script called with non-root privileges
+            The Pi-hole requires elevated privleges to uninstall"
+        exit 1
+    fi
 fi
 
-spinner()
-{
-    local pid=$1
-    local delay=0.50
-    local spinstr='/-\|'
-    while [ "$(ps a | awk '{print $1}' | grep "$pid")" ]; do
-        local temp=${spinstr#?}
-        printf " [%c]  " "$spinstr"
-        local spinstr=$temp${spinstr%"$temp"}
-        sleep $delay
-        printf "\b\b\b\b\b\b"
+readonly PI_HOLE_FILES_DIR="/etc/.pihole"
+PH_TEST="true"
+source "${PI_HOLE_FILES_DIR}/automated install/basic-install.sh"
+# setupVars set in basic-install.sh
+source "${setupVars}"
+
+# distro_check() sourced from basic-install.sh
+distro_check
+
+# Install packages used by the Pi-hole
+DEPS=("${INSTALLER_DEPS[@]}" "${PIHOLE_DEPS[@]}")
+if [[ "${INSTALL_WEB_SERVER}" == true ]]; then
+    # Install the Web dependencies
+    DEPS+=("${PIHOLE_WEB_DEPS[@]}")
+fi
+
+# Compatibility
+if [ -x "$(command -v apt-get)" ]; then
+    # Debian Family
+    PKG_REMOVE=("${PKG_MANAGER}" -y remove --purge)
+    package_check() {
+        dpkg-query -W -f='${Status}' "$1" 2>/dev/null | grep -c "ok installed"
+    }
+elif [ -x "$(command -v rpm)" ]; then
+    # Fedora Family
+    PKG_REMOVE=("${PKG_MANAGER}" remove -y)
+    package_check() {
+        rpm -qa | grep "^$1-" > /dev/null
+    }
+else
+    echo -e "  ${CROSS} OS distribution not supported"
+    exit 1
+fi
+
+removeAndPurge() {
+    # Purge dependencies
+    echo ""
+    for i in "${DEPS[@]}"; do
+        if package_check "${i}" > /dev/null; then
+            while true; do
+                read -rp "  ${QST} Do you wish to remove ${COL_WHITE}${i}${COL_NC} from your system? [Y/N] " yn
+                case ${yn} in
+                    [Yy]* )
+                        echo -ne "  ${INFO} Removing ${i}...";
+                        ${SUDO} "${PKG_REMOVE[@]}" "${i}" &> /dev/null;
+                        echo -e "${OVER}  ${INFO} Removed ${i}";
+                        break;;
+                    [Nn]* ) echo -e "  ${INFO} Skipped ${i}"; break;;
+                esac
+            done
+        else
+            echo -e "  ${INFO} Package ${i} not installed"
+        fi
     done
-    printf "    \b\b\b\b"
+
+    # Remove dnsmasq config files
+    ${SUDO} rm -f /etc/dnsmasq.conf /etc/dnsmasq.conf.orig /etc/dnsmasq.d/*-pihole*.conf &> /dev/null
+    echo -e "  ${TICK} Removing dnsmasq config files"
+
+    # Call removeNoPurge to remove Pi-hole specific files
+    removeNoPurge
 }
 
-function removeAndPurge {
-	# Purge dependencies
-echo ":::"
-	# Nate 3/28/2016 - Removed `php5-cgi` and `php5` as they are removed with php5-common
-	dependencies=( dnsutils bc toilet figlet dnsmasq lighttpd php5-common git curl unzip wget )
-	for i in "${dependencies[@]}"; do
-		if [ "$(dpkg-query -W --showformat='${Status}\n' "$i" 2> /dev/null | grep -c "ok installed")" -eq 1 ]; then
-			while true; do
-				read -rp "::: Do you wish to remove $i from your system? [y/n]: " yn
-				case $yn in
-					[Yy]* ) printf ":::\tRemoving %s..." "$i"; $SUDO apt-get -y remove --purge "$i" &> /dev/null & spinner $!; printf "done!\n"; break;;
-					[Nn]* ) printf ":::\tSkipping %s" "$i\n"; break;;
-					* ) printf "::: You must answer yes or no!\n";;
-				esac
-			done
-		else
-			printf ":::\tPackage %s not installed... Not removing.\n" "$i"
-		fi
-	done
+removeNoPurge() {
+    # Only web directories/files that are created by Pi-hole should be removed
+    echo -ne "  ${INFO} Removing Web Interface..."
+    ${SUDO} rm -rf /var/www/html/admin &> /dev/null
+    ${SUDO} rm -rf /var/www/html/pihole &> /dev/null
+    ${SUDO} rm -f /var/www/html/index.lighttpd.orig &> /dev/null
 
-	# Remove dependency config files
-	echo "::: Removing dnsmasq config files..."
-	$SUDO rm /etc/dnsmasq.conf /etc/dnsmasq.conf.orig /etc/dnsmasq.d/01-pihole.conf &> /dev/null
+    # If the web directory is empty after removing these files, then the parent html directory can be removed.
+    if [ -d "/var/www/html" ]; then
+        if [[ ! "$(ls -A /var/www/html)" ]]; then
+            ${SUDO} rm -rf /var/www/html &> /dev/null
+        fi
+    fi
+    echo -e "${OVER}  ${TICK} Removed Web Interface"
+ 
+    # Attempt to preserve backwards compatibility with older versions
+    # to guarantee no additional changes were made to /etc/crontab after
+    # the installation of pihole, /etc/crontab.pihole should be permanently
+    # preserved.
+    if [[ -f /etc/crontab.orig ]]; then
+        ${SUDO} mv /etc/crontab /etc/crontab.pihole
+        ${SUDO} mv /etc/crontab.orig /etc/crontab
+        ${SUDO} service cron restart
+        echo -e "  ${TICK} Restored the default system cron"
+    fi
 
-	# Take care of any additional package cleaning
-	printf "::: Auto removing remaining dependencies..."
-	$SUDO apt-get -y autoremove &> /dev/null & spinner $!; printf "done!\n";
-	printf "::: Auto cleaning remaining dependencies..."
-	$SUDO apt-get -y autoclean &> /dev/null & spinner $!; printf "done!\n";
+    # Attempt to preserve backwards compatibility with older versions
+    if [[ -f /etc/cron.d/pihole ]];then
+        ${SUDO} rm -f /etc/cron.d/pihole &> /dev/null
+        echo -e "  ${TICK} Removed /etc/cron.d/pihole"
+    fi
 
-	# Call removeNoPurge to remove PiHole specific files
-	removeNoPurge
-}
+    if package_check lighttpd > /dev/null; then
+        if [[ -f /etc/lighttpd/lighttpd.conf.orig ]]; then
+            ${SUDO} mv /etc/lighttpd/lighttpd.conf.orig /etc/lighttpd/lighttpd.conf
+        fi
 
-function removeNoPurge {
-	echo ":::"
-	# Only web directories/files that are created by pihole should be removed.
-	echo "::: Removing the Pi-hole Web server files..."
-	$SUDO rm -rf /var/www/html/admin &> /dev/null
-	$SUDO rm -rf /var/www/html/pihole &> /dev/null
-	$SUDO rm /var/www/html/index.lighttpd.orig &> /dev/null
+        if [[ -f /etc/lighttpd/external.conf ]]; then
+            ${SUDO} rm /etc/lighttpd/external.conf
+        fi
 
-	# If the web directory is empty after removing these files, then the parent html folder can be removed.
-	if [ -d "/var/www/html" ]; then
-		if [[ ! "$(ls -A /var/www/html)" ]]; then
-    			$SUDO rm -rf /var/www/html &> /dev/null
-		fi
-	fi
+        echo -e "  ${TICK} Removed lighttpd configs"
+    fi
 
-	# Attempt to preserve backwards compatibility with older versions
-	# to guarantee no additional changes were made to /etc/crontab after
-	# the installation of pihole, /etc/crontab.pihole should be permanently
-	# preserved.
-	if [[ -f /etc/crontab.orig ]]; then
-		echo "::: Initial Pi-hole cron detected.  Restoring the default system cron..."
-		$SUDO mv /etc/crontab /etc/crontab.pihole
-		$SUDO mv /etc/crontab.orig /etc/crontab
-		$SUDO service cron restart
-	fi
+    ${SUDO} rm -f /etc/dnsmasq.d/adList.conf &> /dev/null
+    ${SUDO} rm -f /etc/dnsmasq.d/01-pihole.conf &> /dev/null
+    ${SUDO} rm -rf /var/log/*pihole* &> /dev/null
+    ${SUDO} rm -rf /etc/pihole/ &> /dev/null
+    ${SUDO} rm -rf /etc/.pihole/ &> /dev/null
+    ${SUDO} rm -rf /opt/pihole/ &> /dev/null
+    ${SUDO} rm -f /usr/local/bin/pihole &> /dev/null
+    ${SUDO} rm -f /etc/bash_completion.d/pihole &> /dev/null
+    ${SUDO} rm -f /etc/sudoers.d/pihole &> /dev/null
+    echo -e "  ${TICK} Removed config files"
 
-	# Attempt to preserve backwards compatibility with older versions
-	if [[ -f /etc/cron.d/pihole ]];then
-		echo "::: Removing cron.d/pihole..."
-		$SUDO rm /etc/cron.d/pihole &> /dev/null
-	fi
+    # Restore Resolved
+    if [[ -e /etc/systemd/resolved.conf.orig ]]; then
+        ${SUDO} cp -p /etc/systemd/resolved.conf.orig /etc/systemd/resolved.conf
+        systemctl reload-or-restart systemd-resolved
+    fi
 
-	echo "::: Removing config files and scripts..."
-	if [ ! "$(dpkg-query -W --showformat='${Status}\n' lighttpd 2> /dev/null | grep -c "ok installed")" -eq 1 ]; then
-		$SUDO rm -rf /etc/lighttpd/ &> /dev/null
-	else
-		if [ -f /etc/lighttpd/lighttpd.conf.orig ]; then
-			$SUDO mv /etc/lighttpd/lighttpd.conf.orig /etc/lighttpd/lighttpd.conf
-		fi
-	fi
+    # Remove FTL
+    if command -v pihole-FTL &> /dev/null; then
+        echo -ne "  ${INFO} Removing pihole-FTL..."
+        if [[ -x "$(command -v systemctl)" ]]; then
+            systemctl stop pihole-FTL
+        else
+            service pihole-FTL stop
+        fi
+        ${SUDO} rm -f /etc/init.d/pihole-FTL
+        ${SUDO} rm -f /usr/bin/pihole-FTL
+        echo -e "${OVER}  ${TICK} Removed pihole-FTL"
+    fi
 
-	$SUDO rm /etc/dnsmasq.d/adList.conf &> /dev/null
-	$SUDO rm /etc/dnsmasq.d/01-pihole.conf &> /dev/null
-	$SUDO rm -rf /var/log/*pihole* &> /dev/null
-	$SUDO rm -rf /etc/pihole/ &> /dev/null
-	$SUDO rm -rf /etc/.pihole/ &> /dev/null
-	$SUDO rm -rf /opt/pihole/ &> /dev/null
-	$SUDO rm /usr/local/bin/pihole &> /dev/null
-	$SUDO rm /etc/bash_completion.d/pihole
-	
-	echo ":::"
-	printf "::: Finished removing PiHole from your system. Sorry to see you go!\n"
-	printf "::: Reach out to us at https://github.com/pi-hole/pi-hole/issues if you need help\n"
-	printf "::: Reinstall by simpling running\n:::\n:::\tcurl -L https://install.pi-hole.net | bash\n:::\n::: at any time!\n:::\n"
-	printf "::: PLEASE RESET YOUR DNS ON YOUR ROUTER/CLIENTS TO RESTORE INTERNET CONNECTIVITY!\n"
+    # If the pihole manpage exists, then delete and rebuild man-db
+    if [[ -f /usr/local/share/man/man8/pihole.8 ]]; then
+        ${SUDO} rm -f /usr/local/share/man/man8/pihole.8 /usr/local/share/man/man8/pihole-FTL.8 /usr/local/share/man/man5/pihole-FTL.conf.5
+        ${SUDO} mandb -q &>/dev/null
+        echo -e "  ${TICK} Removed pihole man page"
+    fi
+
+    # If the pihole user exists, then remove
+    if id "pihole" &> /dev/null; then
+        if ${SUDO} userdel -r pihole 2> /dev/null; then
+            echo -e "  ${TICK} Removed 'pihole' user"
+        else
+            echo -e "  ${CROSS} Unable to remove 'pihole' user"
+        fi
+    fi
+    # If the pihole group exists, then remove
+    if getent group "pihole" &> /dev/null; then
+        if ${SUDO} groupdel pihole 2> /dev/null; then
+            echo -e "  ${TICK} Removed 'pihole' group"
+        else
+            echo -e "  ${CROSS} Unable to remove 'pihole' group"
+        fi
+    fi
+
+    echo -e "\\n   We're sorry to see you go, but thanks for checking out Pi-hole!
+       If you need help, reach out to us on GitHub, Discourse, Reddit or Twitter
+       Reinstall at any time: ${COL_WHITE}curl -sSL https://install.pi-hole.net | bash${COL_NC}
+
+      ${COL_LIGHT_RED}Please reset the DNS on your router/clients to restore internet connectivity
+      ${COL_LIGHT_GREEN}Uninstallation Complete! ${COL_NC}"
 }
 
 ######### SCRIPT ###########
-echo "::: Preparing to remove packages, be sure that each may be safely removed depending on your operating system."
-echo "::: (SAFE TO REMOVE ALL ON RASPBIAN)"
+if command -v vcgencmd &> /dev/null; then
+    echo -e "  ${INFO} All dependencies are safe to remove on Raspbian"
+else
+    echo -e "  ${INFO} Be sure to confirm if any dependencies should not be removed"
+fi
 while true; do
-	read -rp "::: Do you wish to purge PiHole's dependencies from your OS? (You will be prompted for each package) [y/n]: " yn
-	case $yn in
-		[Yy]* ) removeAndPurge; break;;
-	
-		[Nn]* ) removeNoPurge; break;;
-	esac
+    echo -e "  ${INFO} ${COL_YELLOW}The following dependencies may have been added by the Pi-hole install:"
+    echo -n "    "
+    for i in "${DEPS[@]}"; do
+        echo -n "${i} "
+    done
+    echo "${COL_NC}"
+    read -rp "  ${QST} Do you wish to go through each dependency for removal? (Choosing No will leave all dependencies installed) [Y/n] " yn
+    case ${yn} in
+        [Yy]* ) removeAndPurge; break;;
+        [Nn]* ) removeNoPurge; break;;
+        * ) removeAndPurge; break;;
+    esac
 done
-
-
